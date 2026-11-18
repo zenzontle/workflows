@@ -1,0 +1,134 @@
+name: Code quality
+
+# Runs the calling repository's own package.json scripts, so each repository decides what
+# its checks do. Required scripts: format:check, lint, typecheck. Optional (skipped when
+# missing): test, build. With `e2e: true`, a separate job runs `pnpm e2e` in Chromium.
+# Node.js comes from the project's .nvmrc and pnpm from its packageManager field.
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory holding package.json, relative to the repository root.
+        type: string
+        default: .
+      e2e:
+        description: Run `pnpm e2e` with Playwright Chromium in its own job.
+        type: boolean
+        default: false
+      e2e-build:
+        description: Run `pnpm build` before `pnpm e2e`, for e2e setups that serve the build.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  NEXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  lint:
+    name: Check formatting and lint rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          cache: true
+          install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Check lint rules
+        run: pnpm lint
+
+  verify:
+    name: Typecheck, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          cache: true
+          install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm run --if-present test
+
+      - name: Build
+        run: pnpm run --if-present build
+
+  e2e:
+    name: Browser tests
+    if: inputs.e2e
+    # Independent of verify: it installs and builds on its own, so both run at once.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up pnpm and Node.js
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          cache: true
+          install: false
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Install scripts are disabled, so Playwright's browser download is an explicit step.
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Build
+        if: inputs.e2e-build
+        run: pnpm build
+
+      - name: Run browser tests
+        run: pnpm e2e
+
+      # Also after a job timeout, which GitHub reports as cancelled rather than failed.
+      - name: Upload Playwright report and traces
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report
+          path: |
+            ${{ inputs.working-directory }}/playwright-report/
+            ${{ inputs.working-directory }}/test-results/
+          if-no-files-found: ignore
+          retention-days: 14

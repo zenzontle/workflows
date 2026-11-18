@@ -1,0 +1,138 @@
+name: Auto-merge PRs by default
+
+# Turns on auto-merge for same-repository, non-draft PRs, and turns it off when a PR touches
+# a path listed in CODEOWNERS, since those need a human merge. CODEOWNERS is read from the
+# base commit, so a PR cannot remove its own paths from the list. Call it from a
+# pull_request workflow with types [opened, reopened, ready_for_review, synchronize].
+on:
+  workflow_call:
+
+jobs:
+  auto-merge:
+    name: Enable or disable auto-merge
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Find changed paths owned in CODEOWNERS
+        id: owned
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // BEGIN codeowners
+            // CODEOWNERS uses gitignore-style patterns: a leading or inner "/" anchors the
+            // pattern to the root, a trailing "/" matches a directory, "*" stays within one
+            // path segment, and "**" crosses segments.
+            function patternToRegExp(pattern) {
+              const anchored = pattern.startsWith('/') || pattern.slice(0, -1).includes('/');
+              let body = pattern.replace(/^\//, '');
+              const directory = body.endsWith('/');
+              if (directory) body = body.slice(0, -1);
+              let source = '';
+              for (let i = 0; i < body.length; i++) {
+                const char = body[i];
+                if (char === '*' && body[i + 1] === '*') {
+                  i++;
+                  if (body[i + 1] === '/') {
+                    i++;
+                    source += '(?:.*/)?';
+                  } else {
+                    source += '.*';
+                  }
+                } else if (char === '*') {
+                  source += '[^/]*';
+                } else if (char === '?') {
+                  source += '[^/]';
+                } else {
+                  source += char.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+                }
+              }
+              // "docs/*" matches files in docs but not the contents of nested directories.
+              // Every other pattern also matches a directory's contents, which errs on the side
+              // of requiring a human merge.
+              const fileGlob = body === '*' || body.endsWith('/*');
+              const prefix = anchored ? '^' : '^(?:.*/)?';
+              const suffix = directory ? '/' : fileGlob ? '$' : '(?:/|$)';
+              return new RegExp(prefix + source + suffix);
+            }
+
+            function ownedPatterns(codeowners) {
+              return codeowners
+                .split(/\r?\n/)
+                .map(line => line.replace(/(^|\s)#.*$/, '').trim())
+                .filter(Boolean)
+                .map(line => line.split(/\s+/)[0])
+                .map(patternToRegExp);
+            }
+            // END codeowners
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+
+            // GitHub uses the first CODEOWNERS it finds in these locations.
+            let codeowners = null;
+            for (const path of ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS']) {
+              try {
+                const { data } = await github.rest.repos.getContent({
+                  owner, repo, path, ref: pr.base.sha,
+                });
+                codeowners = Buffer.from(data.content, 'base64').toString('utf8');
+                break;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            if (codeowners === null) {
+              core.setFailed('No CODEOWNERS file on the base branch.');
+              return;
+            }
+
+            const patterns = ownedPatterns(codeowners);
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            // The API lists at most 3000 files; an unlisted file could be an owned one.
+            if (files.length >= 3000) {
+              core.setFailed('The PR changes 3000 or more files, more than the API lists.');
+              return;
+            }
+            // A rename out of an owned path changes that path too.
+            const paths = files.flatMap(file =>
+              file.previous_filename ? [file.filename, file.previous_filename] : [file.filename],
+            );
+            const owned = paths.filter(path => patterns.some(pattern => pattern.test(path)));
+            core.setOutput('owned', owned.join('\n'));
+
+      - name: Enable or disable auto-merge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          OWNED: ${{ steps.owned.outputs.owned }}
+          OUTCOME: ${{ steps.owned.outcome }}
+        # Also after a failed lookup, which must turn auto-merge off rather than on.
+        if: always()
+        run: |
+          # Disabling fails when auto-merge is already off, so check the result instead.
+          disable_auto() {
+            gh pr merge "$PR_URL" --disable-auto ||
+              [ "$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest == null')" = true ] ||
+              { echo "::error::Could not turn auto-merge off."; exit 1; }
+          }
+          if [ "$OUTCOME" != success ]; then
+            echo "Could not check paths against CODEOWNERS; a human must merge this PR."
+            disable_auto
+            exit 1
+          elif [ -n "$OWNED" ]; then
+            echo "Paths in CODEOWNERS changed; a human must merge this PR:"
+            echo "$OWNED"
+            disable_auto
+          else
+            gh pr merge "$PR_URL" --auto --merge
+          fi
